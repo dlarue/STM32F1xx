@@ -455,22 +455,31 @@ probe_state_t probeGetState (void)
 
 #endif
 
+#ifdef PWM_SPINDLE
+
 // Static spindle (off, on cw & on ccw)
 
 inline static void spindle_off (void)
 {
-    BITBAND_PERI(SPINDLE_ENABLE_PORT->ODR, SPINDLE_ENABLE_PIN) = settings.spindle.invert.on;
+#ifdef SPINDLE_ENABLE_PIN
+    DIGITAL_OUT(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, settings.spindle.invert.on);
+#endif
 }
 
 inline static void spindle_on (void)
 {
-    BITBAND_PERI(SPINDLE_ENABLE_PORT->ODR, SPINDLE_ENABLE_PIN) = !settings.spindle.invert.on;
+#ifdef SPINDLE_ENABLE_PIN
+    DIGITAL_OUT(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, !settings.spindle.invert.on);
+#endif
+#if SPINDLE_SYNC_ENABLE
+    spindleDataReset();
+#endif
 }
 
 #ifdef SPINDLE_DIRECTION_PIN
 inline static void spindle_dir (bool ccw)
 {
-    BITBAND_PERI(SPINDLE_DIRECTION_PORT->ODR, SPINDLE_DIRECTION_PIN) = ccw ^ settings.spindle.invert.ccw;
+    DIGITAL_OUT(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, ccw ^ settings.spindle.invert.ccw);
 }
 #endif
 
@@ -489,6 +498,8 @@ static void spindleSetState (spindle_state_t state, float rpm)
 
 // Variable spindle control functions
 
+#ifdef SPINDLE_PWM_TIMER_N
+
 // Sets spindle speed
 static void spindle_set_speed (uint_fast16_t pwm_value)
 {
@@ -497,20 +508,28 @@ static void spindle_set_speed (uint_fast16_t pwm_value)
         if(settings.spindle.flags.enable_rpm_controlled)
             spindle_off();
         if(spindle_pwm.always_on) {
-            SPINDLE_PWM_TIMER->CCR1 = spindle_pwm.off_value;
+            SPINDLE_PWM_TIMER_CCR = spindle_pwm.off_value;
+#if SPINDLE_PWM_TIMER_N == 1
             SPINDLE_PWM_TIMER->BDTR |= TIM_BDTR_MOE;
+#endif
+            SPINDLE_PWM_TIMER_CCR = pwm_value;
         } else
-        	SPINDLE_PWM_TIMER->BDTR &= ~TIM_BDTR_MOE; // Set PWM output low
+#if SPINDLE_PWM_TIMER_N == 1
+            SPINDLE_PWM_TIMER->BDTR &= ~TIM_BDTR_MOE; // Set PWM output low
+#else
+            SPINDLE_PWM_TIMER_CCR = 0;
+#endif
     } else {
         if(!pwmEnabled) {
             spindle_on();
             pwmEnabled = true;
         }
-        SPINDLE_PWM_TIMER->CCR1 = pwm_value;
+        SPINDLE_PWM_TIMER_CCR = pwm_value;
+#if SPINDLE_PWM_TIMER_N == 1
         SPINDLE_PWM_TIMER->BDTR |= TIM_BDTR_MOE;
+#endif
     }
 }
-
 
 static uint_fast16_t spindleGetPWM (float rpm)
 {
@@ -521,43 +540,85 @@ static uint_fast16_t spindleGetPWM (float rpm)
 static void spindleSetStateVariable (spindle_state_t state, float rpm)
 {
 #ifdef SPINDLE_DIRECTION_PIN
-    if (state.on)
+    if(state.on)
         spindle_dir(state.ccw);
 #endif
     if(!settings.spindle.flags.enable_rpm_controlled) {
-        if (state.on)
+        if(state.on)
             spindle_on();
         else
             spindle_off();
     }
 
     spindle_set_speed(state.on ? spindle_compute_pwm_value(&spindle_pwm, rpm, false) : spindle_pwm.off_value);
+
+#if SPINDLE_SYNC_ENABLE
+    if(settings.spindle.at_speed_tolerance > 0.0f) {
+        float tolerance = rpm * settings.spindle.at_speed_tolerance / 100.0f;
+        spindle_data.rpm_low_limit = rpm - tolerance;
+        spindle_data.rpm_high_limit = rpm + tolerance;
+    }
+    spindle_data.rpm_programmed = spindle_data.rpm = rpm;
+#endif
 }
+
+#endif // SPINDLE_PWM_TIMER_N
 
 // Returns spindle state in a spindle_state_t variable
 static spindle_state_t spindleGetState (void)
 {
     spindle_state_t state = {settings.spindle.invert.mask};
 
-    state.on = (SPINDLE_ENABLE_PORT->IDR & SPINDLE_ENABLE_BIT) != 0;
+#ifdef SPINDLE_ENABLE_PIN
+    state.on = DIGITAL_IN(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN);
+#endif
 #ifdef SPINDLE_DIRECTION_PIN
-    state.ccw = (SPINDLE_DIRECTION_PORT->IDR & SPINDLE_DIRECTION_BIT) != 0;
+    state.ccw = DIGITAL_IN(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN);
 #endif
     state.value ^= settings.spindle.invert.mask;
+
+#if SPINDLE_SYNC_ENABLE
+    float rpm = spindleGetData(SpindleData_RPM)->rpm;
+    state.at_speed = settings.spindle.at_speed_tolerance <= 0.0f || (rpm >= spindle_data.rpm_low_limit && rpm <= spindle_data.rpm_high_limit);
+    state.encoder_error = spindle_encoder.error_count > 0;
+#endif
 
     return state;
 }
 
+#if PPI_ENABLE
+
+static void spindlePulseOn (uint_fast16_t pulse_length)
+{
+    PPI_TIMER->ARR = pulse_length;
+    PPI_TIMER->EGR = TIM_EGR_UG;
+    PPI_TIMER->CR1 |= TIM_CR1_CEN;
+    spindle_on();
+}
+
+#endif
+
 bool spindleConfig (void)
 {
-    if((hal.spindle.cap.variable = !settings.spindle.flags.pwm_disable && spindle_precompute_pwm_values(&spindle_pwm, SystemCoreClock / (settings.spindle.pwm_freq > 200.0f ? 1 : 25)))) {
+#ifdef SPINDLE_PWM_TIMER_N
+
+    RCC_ClkInitTypeDef clock;
+    uint32_t latency, prescaler = settings.spindle.pwm_freq > 4000.0f ? 1 : (settings.spindle.pwm_freq > 200.0f ? 12 : 25);
+
+    HAL_RCC_GetClockConfig(&clock, &latency);
+
+#if SPINDLE_PWM_TIMER_N == 1
+    if((hal.spindle.cap.variable = !settings.spindle.flags.pwm_disable && spindle_precompute_pwm_values(&spindle_pwm, (HAL_RCC_GetPCLK2Freq() * (clock.APB2CLKDivider == 0 ? 1 : 2)) / prescaler))) {
+#else
+    if((hal.spindle.cap.variable = !settings.spindle.flags.pwm_disable && spindle_precompute_pwm_values(&spindle_pwm, (HAL_RCC_GetPCLK1Freq() * (clock.APB1CLKDivider == 0 ? 1 : 2)) / prescaler))) {
+#endif
 
         hal.spindle.set_state = spindleSetStateVariable;
 
         SPINDLE_PWM_TIMER->CR1 &= ~TIM_CR1_CEN;
 
         TIM_Base_InitTypeDef timerInitStructure = {
-            .Prescaler = (settings.spindle.pwm_freq > 200.0f ? 1 : 25) - 1,
+            .Prescaler = prescaler - 1,
             .CounterMode = TIM_COUNTERMODE_UP,
             .Period = spindle_pwm.period - 1,
             .ClockDivision = TIM_CLOCKDIVISION_DIV1,
@@ -566,32 +627,138 @@ bool spindleConfig (void)
 
         TIM_Base_SetConfig(SPINDLE_PWM_TIMER, &timerInitStructure);
 
-        SPINDLE_PWM_TIMER->CCER &= ~TIM_CCER_CC1E;
-        SPINDLE_PWM_TIMER->CCMR1 &= ~(TIM_CCMR1_OC1M|TIM_CCMR1_CC1S);
-        SPINDLE_PWM_TIMER->CCMR1 |= TIM_CCMR1_OC1M_1|TIM_CCMR1_OC1M_2;
-        SPINDLE_PWM_TIMER->CCR1 = 0;
-        if(settings.spindle.invert.pwm) {
-            SPINDLE_PWM_TIMER->CCER |= TIM_CCER_CC1P;
-            SPINDLE_PWM_TIMER->CR2 |= TIM_CR2_OIS1;
-        } else {
-            SPINDLE_PWM_TIMER->CCER &= ~TIM_CCER_CC1P;
-            SPINDLE_PWM_TIMER->CR2 &= ~TIM_CR2_OIS1;
-        }
+//            RCC_DCKCFGR->
+
+        SPINDLE_PWM_TIMER->CCER &= ~SPINDLE_PWM_CCER_EN;
+        SPINDLE_PWM_TIMER_CCMR &= ~SPINDLE_PWM_CCMR_OCM_CLR;
+        SPINDLE_PWM_TIMER_CCMR |= SPINDLE_PWM_CCMR_OCM_SET;
+        SPINDLE_PWM_TIMER_CCR = 0;
+    #if SPINDLE_PWM_TIMER_N == 1
         SPINDLE_PWM_TIMER->BDTR |= TIM_BDTR_OSSR|TIM_BDTR_OSSI;
-        SPINDLE_PWM_TIMER->CCER |= TIM_CCER_CC1E;
+    #endif
+        if(settings.spindle.invert.pwm) {
+            SPINDLE_PWM_TIMER->CCER |= SPINDLE_PWM_CCER_POL;
+            SPINDLE_PWM_TIMER->CR2 |= SPINDLE_PWM_CR2_OIS;
+        } else {
+            SPINDLE_PWM_TIMER->CCER &= ~SPINDLE_PWM_CCER_POL;
+            SPINDLE_PWM_TIMER->CR2 &= ~SPINDLE_PWM_CR2_OIS;
+        }
+        SPINDLE_PWM_TIMER->CCER |= SPINDLE_PWM_CCER_EN;
         SPINDLE_PWM_TIMER->CR1 |= TIM_CR1_CEN;
 
     } else {
         if(pwmEnabled)
             hal.spindle.set_state((spindle_state_t){0}, 0.0f);
+#endif // SPINDLE_PWM_TIMER_N
         hal.spindle.set_state = spindleSetState;
+#ifdef SPINDLE_PWM_TIMER_N
     }
+#endif
+
+#if SPINDLE_SYNC_ENABLE
+    hal.spindle.cap.at_speed = hal.spindle.get_data == spindleGetData;
+#endif
 
     spindle_update_caps(hal.spindle.cap.variable ? &spindle_pwm : NULL);
 
     return true;
 }
 
+#endif // PWM_SPINDLE
+
+#if SPINDLE_SYNC_ENABLE
+
+static spindle_data_t *spindleGetData (spindle_data_request_t request)
+{
+    bool stopped;
+    uint32_t pulse_length, rpm_timer_delta;
+
+    spindle_encoder_counter_t encoder;
+
+//    while(spindle_encoder.spin_lock);
+
+    __disable_irq();
+
+    memcpy(&encoder, &spindle_encoder.counter, sizeof(spindle_encoder_counter_t));
+
+    pulse_length = spindle_encoder.timer.pulse_length / spindle_encoder.tics_per_irq;
+    rpm_timer_delta = RPM_TIMER_COUNT - spindle_encoder.timer.last_pulse;
+
+    // if 16 bit RPM timer and RPM_TIMER_COUNT < spindle_encoder.timer.last_pulse then what?
+
+    __enable_irq();
+
+    // If no spindle pulses during last 250 ms assume RPM is 0
+    if((stopped = ((pulse_length == 0) || (rpm_timer_delta > spindle_encoder.maximum_tt)))) {
+        spindle_data.rpm = 0.0f;
+        rpm_timer_delta = (uint16_t)(((uint16_t)RPM_COUNTER->CNT - (uint16_t)encoder.last_count)) * pulse_length;
+    }
+
+    switch(request) {
+
+        case SpindleData_Counters:
+            spindle_data.index_count = encoder.index_count;
+            spindle_data.pulse_count = encoder.pulse_count + (uint32_t)((uint16_t)RPM_COUNTER->CNT - (uint16_t)encoder.last_count);
+            spindle_data.error_count = spindle_encoder.error_count;
+            break;
+
+        case SpindleData_RPM:
+            if(!stopped)
+                spindle_data.rpm = spindle_encoder.rpm_factor / (float)pulse_length;
+            break;
+
+        case SpindleData_AngularPosition:
+            spindle_data.angular_position = (float)encoder.index_count +
+                    ((float)((uint16_t)encoder.last_count - (uint16_t)encoder.last_index) +
+                              (pulse_length == 0 ? 0.0f : (float)rpm_timer_delta / (float)pulse_length)) *
+                                spindle_encoder.pulse_distance;
+            break;
+    }
+
+    return &spindle_data;
+}
+
+static void spindleDataReset (void)
+{
+    while(spindleLock);
+
+    uint32_t timeout = uwTick + 1000; // 1 second
+
+    uint32_t index_count = spindle_encoder.counter.index_count + 2;
+    if(spindleGetData(SpindleData_RPM)->rpm > 0.0f) { // wait for index pulse if running
+
+        while(index_count != spindle_encoder.counter.index_count && uwTick <= timeout);
+
+//        if(uwTick > timeout)
+//            alarm?
+    }
+
+
+    RPM_TIMER->EGR |= TIM_EGR_UG; // Reload RPM timer
+    RPM_COUNTER->CR1 &= ~TIM_CR1_CEN;
+
+#if RPM_COUNTER_N == 2
+    rpm_timer_ovf = 0;
+#endif
+
+    spindle_encoder.timer.last_index =
+    spindle_encoder.timer.last_index = RPM_TIMER_COUNT;
+
+    spindle_encoder.timer.pulse_length =
+    spindle_encoder.counter.last_count =
+    spindle_encoder.counter.last_index =
+    spindle_encoder.counter.pulse_count =
+    spindle_encoder.counter.index_count =
+    spindle_encoder.error_count = 0;
+
+    RPM_COUNTER->EGR |= TIM_EGR_UG;
+    RPM_COUNTER->CCR1 = spindle_encoder.tics_per_irq;
+    RPM_COUNTER->CR1 |= TIM_CR1_CEN;
+}
+
+#endif
+
+// end spindle code
 // end spindle code
 
 // Start/stop coolant (and mist if enabled)
