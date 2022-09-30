@@ -1187,9 +1187,13 @@ static bool driver_setup (settings_t *settings)
     }
 
  // Spindle init
+#if SPINDLE_PWM_AF_REMAP
+  AFIO->MAPR |= (SPINDLE_PWM_AF_REMAP << (4 + 2 * SPINDLE_PWM_TIMER_N));
+#endif
 
     GPIO_Init.Pin = 1 << SPINDLE_PWM_PIN;
     GPIO_Init.Mode = GPIO_MODE_AF_PP;
+    GPIO_Init.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(SPINDLE_PWM_PORT, &GPIO_Init);
 
  // Coolant init

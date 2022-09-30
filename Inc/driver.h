@@ -172,15 +172,19 @@
     #define SPINDLE_PWM_TIMER_N     1
     #define SPINDLE_PWM_TIMER_CH    1
     #define SPINDLE_PWM_TIMER_INV   0
-    #define SPINDLE_PWM_TIMER_AF    1
+	#define SPINDLE_PWM_AF_REMAP    0
   #endif
 #elif SPINDLE_PWM_PORT_BASE == GPIOB_BASE
-  #if SPINDLE_PWM_PIN == 0 // PB0 - TIM1_CH2N
+  #if SPINDLE_PWM_PIN == 0 // PB0 - TIM1_CH2
     #define SPINDLE_PWM_TIMER_N     1
     #define SPINDLE_PWM_TIMER_CH    2
     #define SPINDLE_PWM_TIMER_INV   1
-    #define SPINDLE_PWM_TIMER_AF    1
+	#define SPINDLE_PWM_AF_REMAP    0b01
   #endif
+#endif
+
+#if SPINDLE_PWM_AF_REMAP && SPINDLE_PWM_TIMER_N > 3
+#error "Timer 4+ pins cannot be remapped!"
 #endif
 
 #if SPINDLE_PWM_TIMER_CH == 1 || SPINDLE_PWM_TIMER_CH == 2
