@@ -69,6 +69,17 @@
 #define I2C_STROBE_BIT 0
 #endif
 
+#if !SPINDLE_SYNC_ENABLE
+#define SPINDLE_INDEX_BIT 0
+#else
+#ifndef SPINDLE_INDEX_BIT
+#define SPINDLE_INDEX_BIT (1<<SPINDLE_INDEX_PIN)
+#endif
+#ifndef SPINDLE_PULSE_BIT
+#define SPINDLE_PULSE_BIT (1<<SPINDLE_PULSE_PIN)
+#endif
+#endif
+
 #if !SAFETY_DOOR_ENABLE
 #define SAFETY_DOOR_BIT 0
 #endif
@@ -91,6 +102,21 @@ typedef union {
                 unused :6;
     };
 } debounce_t;
+
+#if (!VFD_SPINDLE || N_SPINDLE > 1) && defined(SPINDLE_ENABLE_PIN)
+
+#define PWM_SPINDLE
+
+#if defined(SPINDLE_PWM_TIMER_N)
+
+static bool pwmEnabled = false;
+static spindle_pwm_t spindle_pwm;
+static void spindle_set_speed (uint_fast16_t pwm_value);
+#endif
+
+#elif defined(SPINDLE_PWM_TIMER_N)
+#undef SPINDLE_PWM_TIMER_N
+#endif
 
 #include "grbl/stepdir_map.h"
 
@@ -178,7 +204,7 @@ static output_signal_t outputpin[] = {
 
 extern __IO uint32_t uwTick;
 static uint32_t pulse_length, pulse_delay;
-static bool pwmEnabled = false, IOInitDone = false;
+static bool IOInitDone = false;
 static axes_signals_t next_step_outbits;
 static spindle_pwm_t spindle_pwm;
 static delay_t delay = { .ms = 1, .callback = NULL }; // NOTE: initial ms set to 1 for "resetting" systick timer on startup
@@ -759,7 +785,6 @@ static void spindleDataReset (void)
 #endif
 
 // end spindle code
-// end spindle code
 
 // Start/stop coolant (and mist if enabled)
 static void coolantSetState (coolant_state_t mode)
@@ -823,6 +848,11 @@ void settings_changed (settings_t *settings)
 
     stepperSetStepOutputs((axes_signals_t){0});
     stepperSetDirOutputs((axes_signals_t){0});
+
+#ifdef PWM_SPINDLE
+        if(hal.spindle.get_state == spindleGetState)
+            spindleConfig();
+#endif
 
     if(IOInitDone) {
 
@@ -1242,23 +1272,31 @@ bool driver_init (void)
     hal.probe.configure = probeConfigure;
 #endif
 
+#ifdef PWM_SPINDLE
+
     static const spindle_ptrs_t spindle = {
- #ifdef SPINDLE_DIRECTION_PIN
+#ifdef SPINDLE_DIRECTION_PIN
         .cap.direction = On,
- #endif
- #ifdef SPINDLE_PWM_PIN
-        .cap.laser = On,
+#endif
+#ifdef SPINDLE_PWM_TIMER_N
         .cap.variable = On,
+        .cap.laser = On,
         .cap.pwm_invert = On,
         .get_pwm = spindleGetPWM,
         .update_pwm = spindle_set_speed,
- #endif
+#endif
+#if PPI_ENABLE
+        .pulse_on = spindlePulseOn,
+#endif
         .config = spindleConfig,
         .set_state = spindleSetState,
         .get_state = spindleGetState
     };
 
     spindle_register(&spindle, "PWM");
+
+#endif
+
 
     hal.control.get_state = systemGetState;
 

@@ -255,4 +255,3 @@ void board_init (void);
 bool driver_init (void);
 
 #endif // __DRIVER_H__
-
