@@ -211,8 +211,6 @@
 #define SPINDLE_PWM_AF              timerAF(SPINDLE_PWM_TIMER_N, SPINDLE_PWM_TIMER_AF)
 #define SPINDLE_PWM_CLOCK_ENA       timerCLKENA(SPINDLE_PWM_TIMER_N)
 
-#endif // SPINDLE_PWM_PORT_BASE
-
 #if defined(SPINDLE_PWM_PIN) && !defined(SPINDLE_PWM_TIMER_N)
 #ifdef SPINDLE_PWM_PORT
 #error Map spindle port by defining SPINDLE_PWM_PORT_BASE in the map file!
@@ -220,6 +218,8 @@
 #error Spindle PWM not supported on mapped pin!
 #endif
 #endif
+
+#endif // SPINDLE_PWM_PORT_BASE
 
 typedef struct {
     pin_function_t id;
